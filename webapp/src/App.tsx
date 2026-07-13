@@ -20,7 +20,7 @@ import {
   loadProfileSnapshot,
   saveProfileSnapshot,
   revokeCurrentSession,
-  getTotpStatus,
+  getTwoFactorProviderStatus,
   getVaultRevisionDate,
   saveSession,
   stripProfileSecrets,
@@ -58,6 +58,7 @@ import {
   type PendingPasskeyPassword,
   type PendingTotp,
 } from '@/lib/app-auth';
+import { assertTwoFactorPasskey } from '@/lib/account-passkeys';
 import useAccountSecurityActions from '@/hooks/useAccountSecurityActions';
 import useAdminActions from '@/hooks/useAdminActions';
 import useBackupActions from '@/hooks/useBackupActions';
@@ -67,6 +68,7 @@ import { t } from '@/lib/i18n';
 import { APP_NOTIFY_EVENT, type AppNotifyDetail } from '@/lib/app-notify';
 import { dispatchBackupProgress, type BackupProgressDetail } from '@/lib/backup-restore-progress';
 import { clearOfflineUnlockRecord } from '@/lib/offline-auth';
+import { clearPasswordSecurityCache } from '@/lib/password-security-cache';
 import { decryptSends, decryptVaultCore } from '@/lib/vault-decrypt';
 import { decryptSendsInWorker, decryptVaultCoreInWorker } from '@/lib/vault-worker';
 import {
@@ -110,6 +112,8 @@ const APP_ROUTE_PATHS = [
   '/',
   '/vault',
   '/vault/totp',
+  '/security/password-health',
+  '/generator',
   '/sends',
   '/admin',
   '/logs',
@@ -152,6 +156,8 @@ const SIGNALR_UPDATE_TYPE_AUTH_REQUEST = 15;
 const SIGNALR_UPDATE_TYPE_AUTH_REQUEST_RESPONSE = 16;
 const SIGNALR_UPDATE_TYPE_DEVICE_STATUS = 101;
 const SIGNALR_UPDATE_TYPE_BACKUP_RESTORE_PROGRESS = 102;
+const TWO_FACTOR_PROVIDER_YUBIKEY = 3;
+const TWO_FACTOR_PROVIDER_WEBAUTHN = 7;
 
 type ThemePreference = 'system' | 'light' | 'dark';
 type LockTimeoutMinutes = 0 | 1 | 5 | 15 | 30;
@@ -225,6 +231,7 @@ export default function App() {
     hint: null,
   });
   const [inviteCodeFromUrl, setInviteCodeFromUrl] = useState(initialInviteCode);
+  const [hashPathRaw, setHashPathRaw] = useState(() => (typeof window !== 'undefined' ? window.location.hash || '' : ''));
   const [unlockPassword, setUnlockPassword] = useState('');
   const [pendingTotp, setPendingTotp] = useState<PendingTotp | null>(null);
   const [pendingTotpMode, setPendingTotpMode] = useState<'login' | 'unlock' | null>(null);
@@ -292,15 +299,16 @@ export default function App() {
   }, [pushToast]);
 
   useEffect(() => {
-    const syncInviteFromUrl = () => {
+    const syncUrlState = () => {
       setInviteCodeFromUrl(readInviteCodeFromUrl());
+      setHashPathRaw(window.location.hash || '');
     };
-    syncInviteFromUrl();
-    window.addEventListener('hashchange', syncInviteFromUrl);
-    window.addEventListener('popstate', syncInviteFromUrl);
+    syncUrlState();
+    window.addEventListener('hashchange', syncUrlState);
+    window.addEventListener('popstate', syncUrlState);
     return () => {
-      window.removeEventListener('hashchange', syncInviteFromUrl);
-      window.removeEventListener('popstate', syncInviteFromUrl);
+      window.removeEventListener('hashchange', syncUrlState);
+      window.removeEventListener('popstate', syncUrlState);
     };
   }, []);
 
@@ -379,6 +387,10 @@ export default function App() {
       setUnlockPreparing(false);
     }
   }, [phase, profile, session]);
+
+  useEffect(() => {
+    if (phase !== 'app') clearPasswordSecurityCache();
+  }, [phase]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -654,19 +666,38 @@ export default function App() {
     }
   }
 
+  function handleSelectTotpProvider(providerType: number) {
+    if (totpSubmitting) return;
+    setPendingTotp((current) => {
+      if (!current || current.providerType === providerType) return current;
+      const canUseProvider = current.availableProviders.includes(providerType);
+      if (!canUseProvider) return current;
+      return {
+        ...current,
+        providerType,
+        providerData: current.providerDataByType[providerType],
+      };
+    });
+    setTotpCode('');
+  }
+
   async function handleTotpVerify() {
     if (totpSubmitting) return;
     if (!pendingTotp) return;
-    if (!totpCode.trim()) {
-      pushToast('error', t('txt_please_input_totp_code'));
+    const isPasskeyTwoFactor = pendingTotp.providerType === TWO_FACTOR_PROVIDER_WEBAUTHN;
+    if (!isPasskeyTwoFactor && !totpCode.trim()) {
+      pushToast('error', pendingTotp.providerType === TWO_FACTOR_PROVIDER_YUBIKEY ? t('txt_please_input_yubikey_otp') : t('txt_please_input_totp_code'));
       return;
     }
     setTotpSubmitting(true);
     try {
-      const login = await performTotpLogin(pendingTotp, totpCode, rememberDevice);
+      const token = isPasskeyTwoFactor
+        ? await assertTwoFactorPasskey(pendingTotp.providerData)
+        : totpCode;
+      const login = await performTotpLogin(pendingTotp, token, rememberDevice);
       await finalizeLogin(login);
     } catch (error) {
-      pushToast('error', error instanceof Error ? error.message : t('txt_totp_verify_failed'));
+      pushToast('error', error instanceof Error ? error.message : pendingTotp.providerType === 3 ? t('txt_yubikey_verify_failed') : isPasskeyTwoFactor ? t('txt_passkey_verification_failed') : t('txt_totp_verify_failed'));
     } finally {
       setTotpSubmitting(false);
     }
@@ -847,6 +878,7 @@ export default function App() {
     setDecryptedFolders([]);
     setDecryptedCiphers([]);
     setDecryptedSends([]);
+    clearPasswordSecurityCache();
     setUnlockPassword('');
     setPendingTotp(null);
     setPendingTotpMode(null);
@@ -868,6 +900,7 @@ export default function App() {
     setSession(null);
     clearProfileSnapshot();
     clearOfflineUnlockRecord();
+    clearPasswordSecurityCache();
     setProfile(null);
     setUnlockPreparing(false);
     setPendingTotp(null);
@@ -951,11 +984,14 @@ export default function App() {
         confirm={null}
         onCancelConfirm={() => {}}
         pendingTotpOpen={false}
+        pendingTotpProviderType={0}
+        pendingTotpAvailableProviders={[]}
         totpCode=""
         rememberDevice={false}
         onTotpCodeChange={() => {}}
         onRememberDeviceChange={() => {}}
         onConfirmTotp={() => {}}
+        onSelectTotpProvider={() => {}}
         onCancelTotp={() => {}}
         onUseRecoveryCode={() => {}}
         totpSubmitting={false}
@@ -1081,9 +1117,9 @@ export default function App() {
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && isAdmin && vaultInitialDecryptDone,
     staleTime: 30_000,
   });
-  const totpStatusQuery = useQuery({
-    queryKey: ['totp-status', vaultCacheKey || session?.email],
-    queryFn: () => getTotpStatus(authedFetch),
+  const twoFactorStatusQuery = useQuery({
+    queryKey: ['two-factor-status', vaultCacheKey || session?.email],
+    queryFn: () => getTwoFactorProviderStatus(authedFetch),
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && vaultInitialDecryptDone,
     staleTime: 30_000,
   });
@@ -1115,8 +1151,6 @@ export default function App() {
     queryFn: () => listPendingAuthRequests(authedFetch, profile?.email || session?.email || ''),
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && !!session?.symEncKey && !!session?.symMacKey && !!(profile?.email || session?.email),
     staleTime: 5_000,
-    refetchInterval: 15_000,
-    refetchIntervalInBackground: true,
   });
   const pendingAuthRequests = (pendingAuthRequestsQuery.data || []).filter(isPendingAuthRequest);
   const latestPendingAuthRequest = pendingAuthRequests[0] || null;
@@ -1142,7 +1176,6 @@ export default function App() {
       const key = await encryptSessionUserKeyForAuthRequest(session, authRequest);
       await respondToAuthRequest(authedFetch, authRequest.id, {
         key,
-        masterPasswordHash: null,
         deviceIdentifier: getCurrentDeviceIdentifier(),
         requestApproved: true,
       });
@@ -1818,11 +1851,13 @@ export default function App() {
     onNotify: pushToast,
     onProfileUpdated: setProfile,
     onSetConfirm: setConfirm,
-    refetchTotpStatus: totpStatusQuery.refetch,
+    refetchTwoFactorStatus: twoFactorStatusQuery.refetch,
     refetchAuthorizedDevices: authorizedDevicesQuery.refetch,
   });
   const adminActions = useAdminActions({
     authedFetch,
+    email: String(profile?.email || session?.email || ''),
+    defaultKdfIterations,
     onNotify: pushToast,
     onSetConfirm: setConfirm,
     refetchUsers: usersQuery.refetch,
@@ -1839,7 +1874,6 @@ export default function App() {
     await pendingAuthRequestsQuery.refetch();
   };
 
-  const hashPathRaw = typeof window !== 'undefined' ? window.location.hash || '' : '';
   const hashPath = hashPathRaw.startsWith('#') ? hashPathRaw.slice(1) : hashPathRaw;
   const hashPathOnly = String(hashPath || '').split('?')[0].split('#')[0];
   const trimmedHashPath = hashPathOnly.replace(/^\/+/, '').replace(/\/+$/, '');
@@ -1878,13 +1912,17 @@ export default function App() {
   const mobilePrimaryRoute =
     location === '/sends'
       ? '/sends'
+      : location === '/generator'
+        ? '/generator'
       : location === '/vault/totp'
         ? '/vault/totp'
         : location === '/vault'
           ? '/vault'
           : '/settings';
   const currentPageTitle = (() => {
+    if (location === '/security/password-health') return t('txt_password_security');
     if (location === '/vault/totp') return t('txt_verification_code');
+    if (location === '/generator') return t('txt_password_generator');
     if (location === '/sends') return t('nav_sends');
     if (location === '/admin') return t('nav_admin_panel');
     if (location === '/logs') return t('nav_log_center');
@@ -1941,6 +1979,7 @@ export default function App() {
     session,
     mobileLayout,
     mobileSidebarToggleKey,
+    themePreference,
     importRoute: IMPORT_ROUTE,
     settingsHomeRoute: SETTINGS_HOME_ROUTE,
     settingsAccountRoute: SETTINGS_ACCOUNT_ROUTE,
@@ -1955,10 +1994,13 @@ export default function App() {
     invites: invitesQuery.data || [],
     adminLoading: (usersQuery.isFetching && !usersQuery.data) || (invitesQuery.isFetching && !invitesQuery.data),
     adminError: usersQuery.isError || invitesQuery.isError ? t('txt_load_admin_data_failed') : '',
-    totpEnabled: !!totpStatusQuery.data?.enabled,
+    totpEnabled: !!twoFactorStatusQuery.data?.totpEnabled,
+    yubikeyEnabled: !!twoFactorStatusQuery.data?.yubikeyEnabled,
+    passkey2faEnabled: !!twoFactorStatusQuery.data?.passkeyEnabled,
     lockTimeoutMinutes,
     sessionTimeoutAction,
     authorizedDevices: authorizedDevicesQuery.data || [],
+    currentDeviceIdentifier: getCurrentDeviceIdentifier(),
     authorizedDevicesLoading: authorizedDevicesQuery.isFetching,
     authorizedDevicesError: authorizedDevicesQuery.isError && !authorizedDevicesQuery.data ? t('txt_load_devices_failed') : '',
     domainRules: IS_DEMO_MODE ? demoDomainRules : domainRulesQuery.data || null,
@@ -1967,6 +2009,7 @@ export default function App() {
     onNavigate: navigate,
     onLogout: handleLogout,
     onNotify: pushToast,
+    onThemePreferenceChange: setThemePreference,
     onImport: vaultSendActions.importVault,
     onImportEncryptedRaw: vaultSendActions.importEncryptedRaw,
     onExport: vaultSendActions.exportVault,
@@ -2003,9 +2046,18 @@ export default function App() {
     onSavePasswordHint: accountSecurityActions.savePasswordHint,
     onEnableTotp: async (secret: string, token: string, masterPassword: string) => {
       await accountSecurityActions.enableTotp(secret, token, masterPassword);
-      await totpStatusQuery.refetch();
+      await twoFactorStatusQuery.refetch();
     },
     onOpenDisableTotp: () => setDisableTotpOpen(true),
+    onGetYubiKeySettings: accountSecurityActions.getYubiKeySettings,
+    onSaveYubiKeySettings: accountSecurityActions.saveYubiKeySettings,
+    onSaveYubiKeyApiCredentials: accountSecurityActions.saveYubiKeyApiCredentials,
+    onBootstrapYubiKeyApiCredentials: accountSecurityActions.bootstrapYubiKeyApiCredentials,
+    onDisableYubiKey: accountSecurityActions.disableYubiKey,
+    onGetTwoFactorPasskeySettings: accountSecurityActions.getTwoFactorPasskeySettings,
+    onCreateTwoFactorPasskey: accountSecurityActions.createTwoFactorPasskey,
+    onDeleteTwoFactorPasskey: accountSecurityActions.deleteTwoFactorPasskey,
+    onDisableTwoFactorPasskeys: accountSecurityActions.disableTwoFactorPasskeys,
     onGetRecoveryCode: accountSecurityActions.getRecoveryCode,
     onGetApiKey: accountSecurityActions.getApiKey,
     onRotateApiKey: accountSecurityActions.rotateApiKey,
@@ -2013,8 +2065,12 @@ export default function App() {
     onCreateAccountPasskey: accountSecurityActions.createAccountPasskey,
     onEnableAccountPasskeyDirectUnlock: accountSecurityActions.enableAccountPasskeyDirectUnlock,
     onDeleteAccountPasskey: accountSecurityActions.deleteAccountPasskey,
+    onRefreshTwoFactorStatus: async () => {
+      await twoFactorStatusQuery.refetch();
+    },
     pendingAuthRequests,
-    pendingAuthRequestsLoading: pendingAuthRequestsQuery.isFetching,
+    pendingAuthRequestsLoading: pendingAuthRequestsQuery.isLoading,
+    pendingAuthRequestsRefreshing: pendingAuthRequestsQuery.isFetching && !pendingAuthRequestsQuery.isLoading,
     onRefreshPendingAuthRequests: async () => {
       await pendingAuthRequestsQuery.refetch();
     },
@@ -2031,14 +2087,16 @@ export default function App() {
     onRevokeDeviceTrust: accountSecurityActions.openRevokeDeviceTrust,
     onTrustDevicePermanently: accountSecurityActions.openTrustDevicePermanently,
     onRemoveDevice: accountSecurityActions.openRemoveDevice,
+    onRemoveSelectedDevices: accountSecurityActions.openRemoveSelectedDevices,
     onRevokeAllDeviceTrust: accountSecurityActions.openRevokeAllDeviceTrust,
     onRemoveAllDevices: accountSecurityActions.openRemoveAllDevices,
     onRefreshAdmin: adminActions.refreshAdmin,
     onCreateInvite: adminActions.createInvite,
+    onDeleteInvalidInvites: adminActions.deleteInvalidInvites,
     onDeleteAllInvites: adminActions.deleteAllInvites,
     onToggleUserStatus: adminActions.toggleUserStatus,
     onDeleteUser: adminActions.deleteUser,
-    onRevokeInvite: adminActions.revokeInvite,
+    onDeleteInvite: adminActions.deleteInvite,
     onLoadAuditLogs: (filters: AuditLogFilters) => listAuditLogs(authedFetch, filters),
     onLoadAuditLogSettings: () => getAuditLogSettings(authedFetch),
     onSaveAuditLogSettings: (settings: AuditLogSettings) => saveAuditLogSettings(authedFetch, settings),
@@ -2077,8 +2135,14 @@ export default function App() {
       const hash = await deriveCurrentMasterPasswordHash(masterPassword);
       return backupActions.downloadRemoteBackup(hash, destinationId, path, onProgress);
     },
-    onInspectRemoteBackup: backupActions.inspectRemoteBackup,
-    onDeleteRemoteBackup: backupActions.deleteRemoteBackup,
+    onInspectRemoteBackup: async (masterPassword: string, destinationId: string, path: string) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.inspectRemoteBackup(hash, destinationId, path);
+    },
+    onDeleteRemoteBackup: async (masterPassword: string, destinationId: string, path: string) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.deleteRemoteBackup(hash, destinationId, path);
+    },
     onRestoreRemoteBackup: async (masterPassword: string, destinationId: string, path: string, replaceExisting?: boolean) => {
       const hash = await deriveCurrentMasterPasswordHash(masterPassword);
       return backupActions.restoreRemoteBackup(hash, destinationId, path, replaceExisting);
@@ -2204,11 +2268,14 @@ export default function App() {
           confirm={confirm}
           onCancelConfirm={() => setConfirm(null)}
           pendingTotpOpen={!!pendingTotp}
+          pendingTotpProviderType={pendingTotp?.providerType ?? 0}
+          pendingTotpAvailableProviders={pendingTotp?.availableProviders ?? []}
           totpCode={totpCode}
           rememberDevice={rememberDevice}
           onTotpCodeChange={setTotpCode}
           onRememberDeviceChange={setRememberDevice}
           onConfirmTotp={() => void handleTotpVerify()}
+          onSelectTotpProvider={handleSelectTotpProvider}
           onCancelTotp={() => {
             if (totpSubmitting) return;
             setPendingTotp(null);
@@ -2263,11 +2330,14 @@ export default function App() {
         confirm={confirm}
         onCancelConfirm={() => setConfirm(null)}
         pendingTotpOpen={false}
+        pendingTotpProviderType={0}
+        pendingTotpAvailableProviders={[]}
         totpCode=""
         rememberDevice={false}
         onTotpCodeChange={() => {}}
         onRememberDeviceChange={() => {}}
         onConfirmTotp={() => {}}
+        onSelectTotpProvider={() => {}}
         onCancelTotp={() => {}}
         onUseRecoveryCode={() => {}}
         totpSubmitting={false}
