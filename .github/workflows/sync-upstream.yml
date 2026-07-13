@@ -3,6 +3,9 @@ name: Sync upstream
 on:
   schedule:
     - cron: "0 3 * * *"
+  push:
+    paths:
+      - ".github/workflows/sync-upstream.yml"
   workflow_dispatch:
     inputs:
       target_commit:
@@ -37,7 +40,7 @@ jobs:
           TRIGGER="${{ github.event_name }}"
           MANUAL_INPUT="${{ github.event.inputs.target_commit }}"
 
-          if [ "$TRIGGER" = "schedule" ]; then
+          if [ "$TRIGGER" = "schedule" ] || [ "$TRIGGER" = "push" ]; then
             # Auto mode: resolve latest upstream release tag
             LATEST_TAG=$(curl -s https://api.github.com/repos/shuaiplus/NodeWarden/releases/latest | jq -r .tag_name)
             if [ "$LATEST_TAG" = "null" ] || [ -z "$LATEST_TAG" ]; then
